@@ -1,5 +1,5 @@
 import os
-import cgi
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 UPLOAD_DIRECTORY = "./uploads"
@@ -20,43 +20,57 @@ class SimpleHTTPRequestHandlerWithUpload(BaseHTTPRequestHandler):
             self.send_error(404, "File not found")
 
     def do_POST(self):
-        ctype, pdict = cgi.parse_header(self.headers['Content-Type'])
-        if ctype == 'multipart/form-data':
-            pdict['boundary'] = bytes(pdict['boundary'], "utf-8")
-            content_length = int(self.headers['Content-Length'])
-            fs = cgi.FieldStorage(fp=self.rfile,
-                                  headers=self.headers,
-                                  environ={'REQUEST_METHOD': 'POST'},
-                                  keep_blank_values=True)
+        # Get content length and read the raw POST data
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
 
-            if 'file' not in fs or not fs['file'].filename:
-                self.send_response(400)
+        # Extract boundary from the content type header
+        content_type = self.headers['Content-Type']
+        boundary = content_type.split("=")[1].encode()  # Get boundary for multipart
+
+        # Split the data into parts based on boundary
+        parts = post_data.split(boundary)
+        
+        for part in parts:
+            if b'Content-Disposition' in part:
+                # Find the filename
+                filename_start = part.find(b'filename="') + len(b'filename="')
+                filename_end = part.find(b'"', filename_start)
+                if filename_start == -1 or filename_end == -1:
+                    continue
+                
+                filename = part[filename_start:filename_end].decode('utf-8').strip()
+                
+                # Sanitize the filename to prevent directory traversal attacks
+                filename = re.sub(r'[<>:"/\\|?*]', '_', filename)  # Replace invalid characters
+                if not filename:  # If sanitized filename is empty, skip
+                    continue
+                
+                file_data_start = part.find(b'\r\n\r\n') + 4  # Skip headers
+                file_data_end = part.rfind(b'\r\n')  # End of file data
+                
+                if file_data_start == -1 or file_data_end == -1:
+                    continue
+                
+                file_data = part[file_data_start:file_data_end]
+
+                # Save the file
+                if not os.path.exists(UPLOAD_DIRECTORY):
+                    os.makedirs(UPLOAD_DIRECTORY)
+
+                output_file_path = os.path.join(UPLOAD_DIRECTORY, filename)
+                
+                with open(output_file_path, 'wb') as output_file:
+                    output_file.write(file_data)
+
+                self.send_response(200)
                 self.end_headers()
-                self.wfile.write(b'Error: No file chosen for upload. Please choose a file and try again.')
+                self.wfile.write(b'File uploaded successfully\n')
                 return
 
-            file_item = fs['file']
-            filename = os.path.basename(file_item.filename)
-            file_data = file_item.file.read()
-
-            if not file_data:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b'Error: No file content. Please choose a file with content and try again.')
-                return
-
-            if not os.path.exists(UPLOAD_DIRECTORY):
-                os.makedirs(UPLOAD_DIRECTORY)
-            with open(os.path.join(UPLOAD_DIRECTORY, filename), 'wb') as output_file:
-                output_file.write(file_data)
-
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'File uploaded successfully\n')
-        else:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'Bad request')
+        self.send_response(400)
+        self.end_headers()
+        self.wfile.write(b'Error: No valid file found in upload.')
 
     def list_uploads(self):
         try:
@@ -67,7 +81,7 @@ class SimpleHTTPRequestHandlerWithUpload(BaseHTTPRequestHandler):
             response = f"""
                 <html>
                 <head>
-                    <title>CurlSerpentServer</title>
+                    <title>CurlPythonServer</title>
                     <meta charset="UTF-8">
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; }}
@@ -103,7 +117,6 @@ class SimpleHTTPRequestHandlerWithUpload(BaseHTTPRequestHandler):
                     <ul>
             """
             for file_name in file_list:
-                file_path = os.path.join(UPLOAD_DIRECTORY, file_name)
                 response += f'<li><a href="/uploads/{file_name}">{file_name}</a></li>'
             response += """
                     </ul>
@@ -128,8 +141,14 @@ class SimpleHTTPRequestHandlerWithUpload(BaseHTTPRequestHandler):
 
     def serve_file(self):
         try:
-            file_path = self.path[1:]  # remove leading '/'
+            # Correctly construct the file path by removing '/uploads/' from self.path
+            file_name = self.path.split('/')[-1]  # Get only the filename
+            file_path = os.path.join(UPLOAD_DIRECTORY, file_name)
+            
+            print(f"Attempting to serve file at path: {file_path}")  # Debugging output
+            
             if not os.path.exists(file_path):
+                print(f"File not found at path: {file_path}")  # Debugging output
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b'File not found')
@@ -142,14 +161,21 @@ class SimpleHTTPRequestHandlerWithUpload(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(file.read())
         except Exception as e:
+            print(f"Error serving file: {str(e)}")  # Debugging output
             self.send_error(500, str(e))
 
 def run(server_class=HTTPServer, handler_class=SimpleHTTPRequestHandlerWithUpload, port=8000):
     server_address = ('', port)
     httpd = server_class(server_address, handler_class)
     print(f'Starting httpd server on port {port}')
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer is shutting down...")
+    finally:
+        httpd.server_close()  # Clean up the server
+        print("Server stopped.")
 
-#main
+# Main
 if __name__ == "__main__":
     run()
